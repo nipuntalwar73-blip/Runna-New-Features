@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Runner Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#060a14;font-family:'Courier New',monospace;color:#fff;}
+@keyframes blink{from{opacity:0.4}to{opacity:1}}
+@keyframes lapPop{0%{transform:scale(1)}40%{transform:scale(1.35)}100%{transform:scale(1)}}
+::-webkit-scrollbar{width:6px;}
+::-webkit-scrollbar-track{background:#0a0e1a;}
+::-webkit-scrollbar-thumb{background:#00e5ff44;border-radius:3px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback} = React;
+
+// ─── Pure JS route parser (no API needed) ────────────────────────────
+// Handles: "A to B in 30 mins", "from X to Y in 25 minutes",
+//          "back to A in 10 min", "then C to D in 5 mins",
+//          "do 4 laps of this", "repeat 3 times" etc.
+function parseRouteLocally(text) {
+  // ── 1. Detect lap/repeat multiplier anywhere in the text ──
+  const lapMatch = text.match(/(?:do|repeat|run|complete)\s+(\w+)\s+(?:laps?|times?|rounds?)/i)
+                || text.match(/(\w+)\s+(?:laps?|times?|rounds?)\s+(?:of|around)?/i);
+  const WORD_NUMS = {one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10};
+  let lapCount = 1;
+  if (lapMatch) {
+    const raw = lapMatch[1].toLowerCase();
+    lapCount = WORD_NUMS[raw] || parseInt(raw) || 1;
+  }
+
+  // ── 2. Strip the lap instruction from the text before parsing segments ──
+  const cleaned = text
+    .replace(/\.?\s*(?:do|repeat|run|complete)\s+\w+\s+(?:laps?|times?|rounds?)(?:\s+of\s+this)?/gi, "")
+    .replace(/\.?\s*\w+\s+(?:laps?|times?|rounds?)\s+(?:of|around)\s+this/gi, "");
+
+  // ── 3. Normalise ──
+  const t = cleaned.toLowerCase()
+    .replace(/minutes?/g, "min")
+    .replace(/hours?/g, "hr")
+    .replace(/\band\b/g, "then")
+    .replace(/,/g, " then ");
+
+  // ── 4. Parse individual segments ──
+  const baseSeg = [];
+  const parts = t.split(/\bthen\b/).map(s => s.trim()).filter(Boolean);
+  for (const part of parts) {
+    const m = part.match(
+      /(?:from\s+)?([a-z0-9 ]+?)\s+(?:to|towards|back\s+to|->|→)\s+([a-z0-9 ]+?)\s+in\s+([\d.]+)\s*(min|hr)?/i
+    );
+    if (m) {
+      let from = m[1].trim()
+        .replace(/^(runner\s+goes\s+from|runner\s+goes|goes\s+from|runner|from|go|run|runs|back\s+to|back)\s+/i,"")
+        .trim();
+      let to = m[2].trim()
+        .replace(/^(to|back\s+to|back)\s+/i,"")
+        .trim();
+      const raw  = parseFloat(m[3]);
+      const unit = (m[4]||"min").toLowerCase();
+      const minutes = unit.startsWith("hr") ? raw*60 : raw;
+      if (from && to && minutes > 0)
+        baseSeg.push({ from: capLabel(from), to: capLabel(to), minutes: parseFloat(minutes.toFixed(2)) });
+    }
+  }
+
+  if (!baseSeg.length) return [];
+
+  // ── 5. Repeat base segments for requested laps ──
+  const segs = [];
+  for (let lap = 0; lap < lapCount; lap++) {
+    for (const s of baseSeg) segs.push({ ...s });
+  }
+  return segs;
+}
+
+function capLabel(s) {
+  s = s.trim();
+  if (s.length <= 3) return s.toUpperCase();
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+const DEFAULT_PROMPT = "Runner goes from A to B in 3 mins, then B to C in 2.5 mins, then C to D in 2 mins, then D to A in 1 mins. Do 4 laps of this";
+const LAP_COLORS = ["#00e5ff","#00ffb3","#f0c040","#ff6b35","#cc66ff","#ff4488"];
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+function lerp(a,b,t){ return a+(b-a)*t; }
+function lerpCoord(c1,c2,t){ return [lerp(c1[0],c2[0],t),lerp(c1[1],c2[1],t)]; }
+function latLngToPixel(lat,lng,bounds,W,H){
+  return [((lng-bounds.west)/(bounds.east-bounds.west))*W,
+          ((bounds.north-lat)/(bounds.north-bounds.south))*H];
+}
+function coordDist(c1,c2){
+  const R=6371,dLat=(c2[0]-c1[0])*Math.PI/180,dLng=(c2[1]-c1[1])*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+Math.cos(c1[0]*Math.PI/180)*Math.cos(c2[0]*Math.PI/180)*Math.sin(dLng/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+function closedCircuitCoords(labels,center,rLat=0.009,rLng=0.012){
+  const n=labels.length,coords={};
+  labels.forEach((l,i)=>{
+    // Start from bottom-left and go clockwise: 225°, 315°, 45°, 135° for 4 points
+    // i=0 → bottom-left (A), i=1 → bottom-right (B), i=2 → top-right (C), i=3 → top-left (D)
+    const a=(2*Math.PI*i/n)+(Math.PI*1.25); // offset so first point is bottom-left
+    coords[l]=[center[0]+rLat*Math.sin(a),center[1]+rLng*Math.cos(a)];
+  });
+  return coords;
+}
+function buildCoords(segs){
+  // Always build a fresh closed circuit from ALL unique labels — ignores stale coords
+  const allLabels=[...new Set(segs.flatMap(s=>[s.from,s.to]))];
+  return closedCircuitCoords(allLabels,[12.9780,77.5990],0.010,0.013);
+}
+function computeLapBoundaries(segs,coordsMap){
+  if(!segs.length) return [];
+  const startLabel=segs[0].from, startCoord=coordsMap[startLabel];
+  if(!startCoord) return [];
+  const boundaries=[]; let leftStart=false;
+  segs.forEach((seg,i)=>{
+    if(seg.from!==startLabel) leftStart=true;
+    if(leftStart&&seg.to===startLabel){ boundaries.push(i); leftStart=false; }
+    else if(leftStart&&coordsMap[seg.to]&&coordDist(coordsMap[seg.to],startCoord)<0.15){
+      boundaries.push(i); leftStart=false;
+    }
+  });
+  return boundaries;
+}
+function smoothNoise(t,seed=0){
+  const i=Math.floor(t),f=t-i,fade=f*f*f*(f*(f*6-15)+10);
+  const r1=Math.abs((Math.sin((i+seed)*127.1+311.7)*43758.5453)%1);
+  const r2=Math.abs((Math.sin((i+1+seed)*127.1+311.7)*43758.5453)%1);
+  return lerp(r1,r2,fade);
+}
+function realisticSpeed(baseKmh,t,segIdx){
+  const n=smoothNoise(t*0.28,segIdx*17)*0.5+smoothNoise(t*1.1,segIdx*31)*0.35+smoothNoise(t*3.9,segIdx*53)*0.15;
+  return Math.max(0.5,baseKmh*(1+(n-0.5)*2*0.38)*(1-(t%60)/60*0.05));
+}
+
+// ─── Speed Gauge ─────────────────────────────────────────────────────
+function SpeedGauge({speedKmh,maxSpeed=20}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const canvas=ref.current; if(!canvas) return;
+    const ctx=canvas.getContext("2d");
+    const W=canvas.width,H=canvas.height,cx=W/2,cy=H*0.58,R=W*0.37;
+    ctx.clearRect(0,0,W,H); ctx.fillStyle="#060a14"; ctx.fillRect(0,0,W,H);
+    const sA=Math.PI*0.78,eA=Math.PI*2.22;
+    ctx.beginPath(); ctx.arc(cx,cy,R,sA,eA);
+    ctx.strokeStyle="rgba(255,255,255,0.07)"; ctx.lineWidth=13; ctx.lineCap="round"; ctx.stroke();
+    const frac=Math.min(speedKmh/maxSpeed,1);
+    if(frac>0){
+      const fe=sA+(eA-sA)*frac;
+      const g=ctx.createLinearGradient(cx-R,cy,cx+R,cy);
+      g.addColorStop(0,"#00e5ff"); g.addColorStop(0.55,"#00ffb3"); g.addColorStop(1,"#ff6b35");
+      ctx.beginPath(); ctx.arc(cx,cy,R,sA,fe);
+      ctx.strokeStyle=g; ctx.lineWidth=13; ctx.lineCap="round"; ctx.stroke();
+      const tx=cx+Math.cos(fe)*R, ty=cy+Math.sin(fe)*R;
+      const tg=ctx.createRadialGradient(tx,ty,0,tx,ty,16);
+      tg.addColorStop(0,"rgba(0,255,180,0.9)"); tg.addColorStop(1,"transparent");
+      ctx.fillStyle=tg; ctx.beginPath(); ctx.arc(tx,ty,16,0,Math.PI*2); ctx.fill();
+    }
+    [0,5,10,15,20].forEach(v=>{
+      const a=sA+(eA-sA)*(v/maxSpeed),cos=Math.cos(a),sin=Math.sin(a);
+      ctx.beginPath(); ctx.moveTo(cx+cos*(R-15),cy+sin*(R-15)); ctx.lineTo(cx+cos*R,cy+sin*R);
+      ctx.strokeStyle="rgba(255,255,255,0.28)"; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.font="8px 'Courier New'";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText(v,cx+cos*(R-26),cy+sin*(R-26));
+    });
+    const nA=sA+(eA-sA)*frac;
+    ctx.save(); ctx.translate(cx,cy); ctx.rotate(nA);
+    const ng=ctx.createLinearGradient(-8,0,R*0.75,0);
+    ng.addColorStop(0,"rgba(255,255,255,0.1)"); ng.addColorStop(0.6,"rgba(255,255,255,0.85)"); ng.addColorStop(1,"#fff");
+    ctx.beginPath(); ctx.moveTo(-8,0); ctx.lineTo(R*0.75,-2.5); ctx.lineTo(R*0.75,2.5); ctx.closePath();
+    ctx.fillStyle=ng; ctx.fill(); ctx.restore();
+    const hb=ctx.createRadialGradient(cx,cy,0,cx,cy,10);
+    hb.addColorStop(0,"#fff"); hb.addColorStop(0.5,"#00e5ff"); hb.addColorStop(1,"#003344");
+    ctx.beginPath(); ctx.arc(cx,cy,10,0,Math.PI*2); ctx.fillStyle=hb; ctx.fill();
+    ctx.fillStyle="#fff"; ctx.font="bold 25px 'Courier New'";
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(speedKmh.toFixed(1),cx,cy+R*0.44);
+    ctx.fillStyle="rgba(0,229,255,0.75)"; ctx.font="bold 9px 'Courier New'";
+    ctx.fillText("km/h",cx,cy+R*0.44+19);
+    const lbl=speedKmh<0.5?"STOPPED":speedKmh<6?"WALKING":speedKmh<12?"JOGGING":"RUNNING";
+    const lc=speedKmh<0.5?"#444":speedKmh<6?"#00e5ff":speedKmh<12?"#00ffb3":"#ff6b35";
+    ctx.fillStyle=lc; ctx.font="bold 9px 'Courier New'"; ctx.fillText(lbl,cx,cy-R*0.52);
+  },[speedKmh]);
+  return React.createElement('canvas',{ref,width:195,height:165,style:{borderRadius:10,display:"block"}});
+}
+
+// ─── Sparkline ───────────────────────────────────────────────────────
+function SpeedSparkline({history}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const canvas=ref.current; if(!canvas||history.length<2) return;
+    const ctx=canvas.getContext("2d"),W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    const pts=history.slice(-250),maxV=Math.max(...pts,1),step=W/(pts.length-1);
+    const grd=ctx.createLinearGradient(0,0,0,H);
+    grd.addColorStop(0,"rgba(0,255,180,0.22)"); grd.addColorStop(1,"rgba(0,255,180,0)");
+    ctx.beginPath();
+    pts.forEach((v,i)=>{const x=i*step,y=H-(v/maxV)*H*0.85; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    ctx.lineTo((pts.length-1)*step,H); ctx.lineTo(0,H); ctx.closePath();
+    ctx.fillStyle=grd; ctx.fill();
+    ctx.beginPath();
+    pts.forEach((v,i)=>{const x=i*step,y=H-(v/maxV)*H*0.85; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    ctx.strokeStyle="#00ffb3"; ctx.lineWidth=1.5; ctx.lineJoin="round"; ctx.stroke();
+  },[history,history.length]);
+  return React.createElement('canvas',{ref,width:340,height:44,style:{width:"100%",height:44,display:"block",borderRadius:6}});
+}
+
+// ─── Lap Counter ─────────────────────────────────────────────────────
+function LapCounter({laps,totalLaps,lapBoundaries,currentSeg,segments,isRunning,lapFlash}){
+  const e=React.createElement;
+  return e('div',{style:{display:"flex",flexDirection:"column"}},
+    // Big number
+    e('div',{style:{display:"flex",alignItems:"flex-end",gap:10,marginBottom:14}},
+      e('div',{style:{
+        fontSize:76,fontWeight:"bold",lineHeight:1,
+        color:laps>0?"#00ffb3":"rgba(255,255,255,0.13)",
+        textShadow:laps>0?"0 0 36px rgba(0,255,180,0.7)":"none",
+        fontFamily:"'Courier New',monospace",
+        animation:lapFlash?"lapPop 0.5s ease":"none",
+        transition:"color 0.3s, text-shadow 0.3s"
+      }},laps),
+      e('div',{style:{paddingBottom:12}},
+        e('div',{style:{fontSize:10,color:"#00e5ff",letterSpacing:4}},`LAP${laps!==1?"S":""}`),
+        totalLaps>0&&e('div',{style:{fontSize:10,color:"rgba(255,255,255,0.3)",marginTop:2}},`of ${totalLaps}`)
+      )
+    ),
+    // Dots
+    totalLaps>0&&e('div',{style:{marginBottom:14}},
+      e('div',{style:{fontSize:9,color:"rgba(255,255,255,0.3)",letterSpacing:3,marginBottom:8}},"LAP PROGRESS"),
+      e('div',{style:{display:"flex",gap:7,flexWrap:"wrap"}},
+        Array.from({length:totalLaps}).map((_,i)=>{
+          const done=i<laps,c=LAP_COLORS[i%LAP_COLORS.length];
+          return e('div',{key:i,style:{
+            width:30,height:30,borderRadius:"50%",
+            border:`2px solid ${done?c:"rgba(255,255,255,0.13)"}`,
+            background:done?`${c}22`:"transparent",
+            display:"flex",alignItems:"center",justifyContent:"center",
+            fontSize:11,fontWeight:"bold",
+            color:done?c:"rgba(255,255,255,0.18)",
+            boxShadow:done?`0 0 12px ${c}66`:"none",
+            transition:"all 0.4s"
+          }},i+1);
+        })
+      )
+    ),
+    // Splits
+    laps>0&&e('div',{style:{marginBottom:14}},
+      e('div',{style:{fontSize:9,color:"rgba(255,255,255,0.3)",letterSpacing:3,marginBottom:8}},"LAP SPLITS"),
+      e('div',{style:{display:"flex",flexDirection:"column",gap:5}},
+        Array.from({length:laps}).map((_,i)=>{
+          const prev=i===0?-1:lapBoundaries[i-1],curr=lapBoundaries[i];
+          let lapMin=0; for(let s=prev+1;s<=curr;s++){if(segments[s])lapMin+=segments[s].minutes;}
+          const c=LAP_COLORS[i%LAP_COLORS.length];
+          return e('div',{key:i,style:{display:"flex",alignItems:"center",gap:8,fontSize:11}},
+            e('div',{style:{width:20,height:20,borderRadius:"50%",background:`${c}22`,border:`1.5px solid ${c}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:"bold",color:c,flexShrink:0}},i+1),
+            e('div',{style:{flex:1,height:3,background:`${c}22`,borderRadius:2}},
+              e('div',{style:{height:"100%",background:c,borderRadius:2,width:"100%"}})
+            ),
+            e('div',{style:{color:"rgba(255,255,255,0.55)",fontSize:11,minWidth:38,textAlign:"right"}},`${lapMin}m`)
+          );
+        })
+      )
+    ),
+    // Current lap bar
+    isRunning&&totalLaps>0&&(()=>{
+      const prevBound=laps===0?-1:lapBoundaries[laps-1],nextBound=lapBoundaries[laps];
+      if(nextBound===undefined) return null;
+      const lapSegs=nextBound-prevBound,segsIntoLap=Math.max(0,currentSeg-(prevBound+1));
+      const lapPct=lapSegs>0?(segsIntoLap/lapSegs)*100:0,c=LAP_COLORS[laps%LAP_COLORS.length];
+      return e('div',null,
+        e('div',{style:{fontSize:9,color:"rgba(255,255,255,0.3)",letterSpacing:3,marginBottom:6}},
+          laps<totalLaps?`LAP ${laps+1} IN PROGRESS`:"FINAL LAP"
+        ),
+        e('div',{style:{height:6,background:"rgba(255,255,255,0.07)",borderRadius:3}},
+          e('div',{style:{height:"100%",borderRadius:3,width:`${Math.min(lapPct,100)}%`,background:`linear-gradient(90deg,${c},${c}88)`,transition:"width 0.3s"}})
+        ),
+        e('div',{style:{fontSize:9,color:"rgba(255,255,255,0.25)",marginTop:3,textAlign:"right"}},`${Math.round(Math.min(lapPct,100))}%`)
+      );
+    })(),
+    totalLaps===0&&e('div',{style:{fontSize:11,color:"rgba(255,255,255,0.18)",lineHeight:1.7,marginTop:6}},
+      "A lap completes when the runner returns to the start point.",
+      e('br'),
+      e('span',{style:{color:"rgba(0,229,255,0.38)"}},"e.g.  A→B→C→A = 1 lap")
+    )
+  );
+}
+
+// ─── Map Canvas ───────────────────────────────────────────────────────
+function MapCanvas({segments,labelCoords,isRunning,progress,currentSeg,lapBoundaries,currentLap}){
+  const ref=useRef(null),mapRef=useRef(null);
+  const [mapLoaded,setMapLoaded]=useState(false);
+  const bounds={north:12.995,south:12.960,west:77.580,east:77.620};
+
+  useEffect(()=>{
+    const img=new Image(); img.crossOrigin="anonymous";
+    img.src="https://tile.openstreetmap.org/15/23086/14458.png";
+    img.onload=()=>{mapRef.current=img; setMapLoaded(true);};
+    img.onerror=()=>setMapLoaded(true);
+  },[]);
+
+  const px=useCallback((coord)=>{
+    const c=ref.current; if(!c) return [0,0];
+    return latLngToPixel(coord[0],coord[1],bounds,c.width,c.height);
+  },[]);
+
+  useEffect(()=>{
+    const canvas=ref.current; if(!canvas) return;
+    const ctx=canvas.getContext("2d"),W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    if(mapRef.current&&mapLoaded){
+      ctx.drawImage(mapRef.current,0,0,W,H);
+      ctx.fillStyle="rgba(6,10,20,0.28)"; ctx.fillRect(0,0,W,H);
+    } else {
+      ctx.fillStyle="#111825"; ctx.fillRect(0,0,W,H);
+      ctx.strokeStyle="rgba(180,150,80,0.18)"; ctx.lineWidth=10;
+      [[W*.5,0,W*.5,H],[0,H*.5,W,H*.5],[0,H*.25,W*.65,H*.85]].forEach(([x1,y1,x2,y2])=>{
+        ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      });
+    }
+    function getLapColor(si){
+      for(let i=0;i<lapBoundaries.length;i++){if(si<=lapBoundaries[i])return LAP_COLORS[i%LAP_COLORS.length];}
+      return LAP_COLORS[lapBoundaries.length%LAP_COLORS.length];
+    }
+    // Future dashed
+    segments.forEach((seg,i)=>{
+      if(i<=currentSeg) return;
+      const fc=labelCoords[seg.from],tc=labelCoords[seg.to]; if(!fc||!tc) return;
+      const [fx,fy]=px(fc),[tx,ty]=px(tc);
+      ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(tx,ty);
+      ctx.strokeStyle="rgba(255,255,255,0.1)"; ctx.lineWidth=2; ctx.setLineDash([7,7]); ctx.stroke(); ctx.setLineDash([]);
+    });
+    // Completed
+    segments.forEach((seg,i)=>{
+      if(i>=currentSeg) return;
+      const fc=labelCoords[seg.from],tc=labelCoords[seg.to]; if(!fc||!tc) return;
+      const [fx,fy]=px(fc),[tx,ty]=px(tc),col=getLapColor(i);
+      ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(tx,ty); ctx.strokeStyle=col+"44"; ctx.lineWidth=6; ctx.lineCap="round"; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(tx,ty); ctx.strokeStyle=col+"cc"; ctx.lineWidth=2; ctx.stroke();
+    });
+    // Current
+    if(segments[currentSeg]){
+      const fc=labelCoords[segments[currentSeg].from],tc=labelCoords[segments[currentSeg].to];
+      if(fc&&tc){
+        const [fx,fy]=px(fc),pos=lerpCoord(fc,tc,progress),[rx,ry]=px(pos);
+        const col=LAP_COLORS[currentLap%LAP_COLORS.length];
+        ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(rx,ry); ctx.strokeStyle=col+"55"; ctx.lineWidth=6; ctx.lineCap="round"; ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(rx,ry); ctx.strokeStyle=col; ctx.lineWidth=2; ctx.stroke();
+        // Glow
+        const grd=ctx.createRadialGradient(rx,ry,0,rx,ry,28);
+        grd.addColorStop(0,col+"66"); grd.addColorStop(1,"transparent");
+        ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(rx,ry,28,0,Math.PI*2); ctx.fill();
+        // Dot
+        ctx.beginPath(); ctx.arc(rx,ry,8,0,Math.PI*2); ctx.fillStyle=col; ctx.fill();
+        ctx.strokeStyle="#fff"; ctx.lineWidth=2; ctx.stroke();
+        // Arrow
+        const dx=tc[1]-fc[1],dy=-(tc[0]-fc[0]),len=Math.hypot(dx,dy)||1,ax=dx/len*13,ay=dy/len*13;
+        ctx.beginPath(); ctx.moveTo(rx+ax,ry+ay); ctx.lineTo(rx+ax-ax*.5-ay*.3,ry+ay-ay*.5+ax*.3); ctx.lineTo(rx+ax-ax*.5+ay*.3,ry+ay-ay*.5-ax*.3); ctx.closePath(); ctx.fillStyle="#fff"; ctx.fill();
+      }
+    }
+    // Lap boundary glows
+    lapBoundaries.forEach((bi,li)=>{
+      const seg=segments[bi]; if(!seg) return;
+      const coord=labelCoords[seg.to]; if(!coord) return;
+      if(bi>=currentSeg) return;
+      const [mpx,mpy]=px(coord),c=LAP_COLORS[li%LAP_COLORS.length];
+      const g=ctx.createRadialGradient(mpx,mpy,0,mpx,mpy,22);
+      g.addColorStop(0,c+"66"); g.addColorStop(1,"transparent");
+      ctx.fillStyle=g; ctx.beginPath(); ctx.arc(mpx,mpy,22,0,Math.PI*2); ctx.fill();
+    });
+    // Waypoint markers — only A, B, C, D (unique circuit points, not repeated per lap)
+    const circuitLabels=[...new Set(segments.slice(0,segments.length/Math.max(lapBoundaries.length,1)||segments.length).flatMap(s=>[s.from,s.to]))];
+    // fallback: just unique labels
+    const markerLabels=[...new Set(segments.flatMap(s=>[s.from,s.to]))];
+    markerLabels.forEach(label=>{
+      const coord=labelCoords[label]; if(!coord) return;
+      const [lpx,lpy]=px(coord);
+      const isStart=label===segments[0]?.from;
+      // outer glow ring
+      ctx.beginPath(); ctx.arc(lpx,lpy,isStart?18:13,0,Math.PI*2);
+      ctx.fillStyle=isStart?"rgba(0,229,255,0.12)":"rgba(0,229,255,0.07)"; ctx.fill();
+      // dot body
+      ctx.beginPath(); ctx.arc(lpx,lpy,isStart?10:8,0,Math.PI*2);
+      ctx.fillStyle="#060a14"; ctx.fill();
+      ctx.strokeStyle="#00e5ff"; ctx.lineWidth=isStart?2.5:2; ctx.stroke();
+      // label inside dot
+      ctx.fillStyle="#00e5ff"; ctx.font=`bold ${isStart?10:9}px 'Courier New'`;
+      ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(label,lpx,lpy);
+      // label above dot
+      ctx.fillStyle="rgba(0,229,255,0.75)"; ctx.font="8px 'Courier New'";
+      ctx.fillText(label,lpx,lpy-(isStart?24:20));
+    });
+  },[segments,labelCoords,isRunning,progress,currentSeg,lapBoundaries,currentLap,mapLoaded,px]);
+
+  return React.createElement('canvas',{ref,width:500,height:430,style:{borderRadius:12,width:"100%",height:"100%",display:"block"}});
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────
+function App(){
+  const [prompt,setPrompt]=useState(DEFAULT_PROMPT);
+  const [segments,setSegments]=useState([]);
+  const [labelCoords,setLabelCoords]=useState({});
+  const [lapBoundaries,setLapBoundaries]=useState([]);
+  const [isRunning,setIsRunning]=useState(false);
+  const [currentSeg,setCurrentSeg]=useState(0);
+  const [progress,setProgress]=useState(0);
+  const [speedKmh,setSpeedKmh]=useState(0);
+  const [elapsed,setElapsed]=useState(0);
+  const [finished,setFinished]=useState(false);
+  const [parseError,setParseError]=useState("");
+  const [log,setLog]=useState([]);
+  const [avgSpeed,setAvgSpeed]=useState(0);
+  const [topSpeed,setTopSpeed]=useState(0);
+  const [pace,setPace]=useState("—");
+  const [speedHistory,setSpeedHistory]=useState([]);
+  const [currentLap,setCurrentLap]=useState(0);
+  const [completedLaps,setCompletedLaps]=useState(0);
+  const [lapFlash,setLapFlash]=useState(false);
+
+  const animRef=useRef(null),startTsRef=useRef(null),histRef=useRef([]);
+  const prevLapsRef=useRef(0);
+  const SIM=60;
+
+  function handleParse(){
+    setParseError(""); setIsRunning(false); setFinished(false);
+    setProgress(0); setCurrentSeg(0); setSpeedKmh(0); setElapsed(0);
+    setLog([]); setAvgSpeed(0); setTopSpeed(0); setPace("—");
+    setSpeedHistory([]); setCompletedLaps(0); setCurrentLap(0); setLapBoundaries([]);
+    cancelAnimationFrame(animRef.current);
+
+    const segs=parseRouteLocally(prompt);
+    if(!segs.length){
+      setParseError("Couldn't parse — try: \"A to B in 30 mins, then B to C in 20 mins\"");
+      return;
+    }
+    const coords=buildCoords(segs);
+    const laps=computeLapBoundaries(segs,coords);
+    setLabelCoords(coords); setSegments(segs); setLapBoundaries(laps);
+    setLog(segs.map(s=>`${s.from} → ${s.to}: ${s.minutes} min`));
+  }
+
+  function startRun(){
+    if(!segments.length) return;
+    histRef.current=[]; prevLapsRef.current=0;
+    setIsRunning(true); setFinished(false); setCurrentSeg(0); setProgress(0);
+    setElapsed(0); setSpeedKmh(0); setAvgSpeed(0); setTopSpeed(0); setPace("—");
+    setSpeedHistory([]); setCompletedLaps(0); setCurrentLap(0); setLapFlash(false);
+    startTsRef.current=performance.now();
+  }
+
+  function resetRun(){
+    cancelAnimationFrame(animRef.current);
+    setIsRunning(false); setFinished(false); setProgress(0); setCurrentSeg(0);
+    setSpeedKmh(0); setElapsed(0); setAvgSpeed(0); setTopSpeed(0); setPace("—");
+    setSpeedHistory([]); setCompletedLaps(0); setCurrentLap(0); setLapFlash(false);
+    histRef.current=[]; prevLapsRef.current=0;
+  }
+
+  useEffect(()=>{
+    if(!lapBoundaries.length) return;
+    const lc=lapBoundaries.filter(b=>b<currentSeg).length;
+    if(lc>prevLapsRef.current){ setLapFlash(true); setTimeout(()=>setLapFlash(false),600); }
+    prevLapsRef.current=lc;
+    setCompletedLaps(lc); setCurrentLap(lc);
+  },[currentSeg,lapBoundaries]);
+
+  useEffect(()=>{
+    if(!isRunning||!segments.length) return;
+    function tick(){
+      const realSec=(performance.now()-startTsRef.current)/1000,simSec=realSec*SIM;
+      setElapsed(simSec);
+      let rem=simSec,seg=0,segEl=simSec;
+      for(let i=0;i<segments.length;i++){
+        const dur=segments[i].minutes*60;
+        if(rem<=dur){seg=i;segEl=rem;break;}
+        rem-=dur;
+        if(i===segments.length-1){
+          setIsRunning(false); setFinished(true); setProgress(1); setCurrentSeg(segments.length); setSpeedKmh(0);
+          const h=histRef.current;
+          if(h.length){
+            const avg=h.reduce((a,b)=>a+b,0)/h.length;
+            setAvgSpeed(parseFloat(avg.toFixed(1)));
+            const pm=avg>0?60/avg:0;
+            setPace(`${Math.floor(pm)}:${String(Math.round((pm%1)*60)).padStart(2,"0")} /km`);
+          }
+          setCompletedLaps(lapBoundaries.length);
+          return;
+        }
+      }
+      const dur=segments[seg].minutes*60;
+      setCurrentSeg(seg); setProgress(Math.min(segEl/dur,1));
+      const fc=labelCoords[segments[seg].from],tc=labelCoords[segments[seg].to];
+      if(fc&&tc){
+        const spd=realisticSpeed(coordDist(fc,tc)/(segments[seg].minutes/60),simSec/5,seg);
+        const rounded=parseFloat(spd.toFixed(1));
+        setSpeedKmh(rounded); histRef.current.push(rounded);
+        if(histRef.current.length%3===0) setSpeedHistory([...histRef.current]);
+        setTopSpeed(prev=>Math.max(prev,rounded));
+        const h=histRef.current,avg=h.reduce((a,b)=>a+b,0)/h.length;
+        setAvgSpeed(parseFloat(avg.toFixed(1)));
+        const pm=avg>0?60/avg:0;
+        setPace(`${Math.floor(pm)}:${String(Math.round((pm%1)*60)).padStart(2,"0")} /km`);
+      }
+      animRef.current=requestAnimationFrame(tick);
+    }
+    animRef.current=requestAnimationFrame(tick);
+    return()=>cancelAnimationFrame(animRef.current);
+  },[isRunning,segments,labelCoords,lapBoundaries]);
+
+  const totalMin=segments.reduce((a,s)=>a+s.minutes,0);
+  const elMin=elapsed/60,pct=totalMin>0?Math.min((elMin/totalMin)*100,100):0;
+  const PBG="rgba(255,255,255,0.025)",PBD="1px solid rgba(0,229,255,0.13)";
+  const LBL={fontSize:10,color:"#00e5ff",letterSpacing:4,marginBottom:8,textTransform:"uppercase"};
+  const e=React.createElement;
+
+  return e('div',{style:{minHeight:"100vh",background:"#060a14",fontFamily:"'Courier New',monospace",display:"flex",flexDirection:"column",alignItems:"center",padding:"18px 12px",gap:14}},
+
+    // ── Header
+    e('div',{style:{textAlign:"center"}},
+      e('div',{style:{fontSize:10,color:"#00e5ff",letterSpacing:7,marginBottom:2}},"◈ ROUTE SIMULATION"),
+      e('div',{style:{fontSize:26,fontWeight:"bold",color:"#fff",textShadow:"0 0 28px rgba(0,229,255,0.5)",letterSpacing:2}},"Runner Tracker")
+    ),
+
+    // ── Prompt box
+    e('div',{style:{width:"100%",maxWidth:1100,background:PBG,border:PBD,borderRadius:12,padding:"14px 18px"}},
+      e('div',{style:LBL},"Route Prompt"),
+      e('div',{style:{fontSize:11,color:"rgba(255,255,255,0.3)",marginBottom:8,lineHeight:1.6}},
+        'Type any route naturally — e.g. ',
+        e('span',{style:{color:"rgba(0,229,255,0.6)"}},'\"A to B in 3 mins, B to C in 2.5 mins, C to D in 2 mins, D to A in 1 min. Do 4 laps\"')
+      ),
+      e('textarea',{value:prompt,onChange:ev=>setPrompt(ev.target.value),rows:2,
+        style:{width:"100%",background:"rgba(0,0,0,0.45)",border:"1px solid rgba(0,229,255,0.12)",borderRadius:8,color:"#d0e8ff",fontSize:13,padding:"9px 13px",resize:"vertical",outline:"none",fontFamily:"'Courier New',monospace",lineHeight:1.7},
+        placeholder:"e.g. A to B in 3 mins, then B to C in 2.5 mins, then C to A in 2 mins. Do 4 laps of this"}),
+      e('div',{style:{display:"flex",gap:10,marginTop:10,alignItems:"center",flexWrap:"wrap"}},
+        e('button',{onClick:handleParse,style:{background:"linear-gradient(135deg,#00e5ff,#00a8bb)",border:"none",borderRadius:8,padding:"9px 22px",color:"#060a14",fontWeight:"bold",fontSize:12,cursor:"pointer",letterSpacing:2,fontFamily:"'Courier New',monospace"}},"⚡ PARSE ROUTE"),
+        segments.length>0&&!isRunning&&!finished&&e('button',{onClick:startRun,style:{background:"linear-gradient(135deg,#00ffb3,#00cc8a)",border:"none",borderRadius:8,padding:"9px 22px",color:"#060a14",fontWeight:"bold",fontSize:12,cursor:"pointer",letterSpacing:2,fontFamily:"'Courier New',monospace"}},"▶ START RUN"),
+        (isRunning||finished)&&e('button',{onClick:resetRun,style:{background:"rgba(255,100,50,0.12)",border:"1px solid rgba(255,100,50,0.38)",borderRadius:8,padding:"9px 22px",color:"#ff6b35",fontWeight:"bold",fontSize:12,cursor:"pointer",letterSpacing:2,fontFamily:"'Courier New',monospace"}},"⏹ RESET"),
+        parseError&&e('span',{style:{color:"#ff6b35",fontSize:12}},parseError),
+        finished&&e('span',{style:{color:"#00ffb3",fontSize:13,fontWeight:"bold"}},"🏁 RUN COMPLETE!")
+      )
+    ),
+
+    // ── Main grid
+    e('div',{style:{display:"flex",gap:12,width:"100%",maxWidth:1100,alignItems:"flex-start",flexWrap:"wrap"}},
+
+      // Map
+      e('div',{style:{flex:"1 1 430px",minWidth:260,height:430,background:PBG,border:PBD,borderRadius:12,overflow:"hidden",position:"relative"}},
+        e(MapCanvas,{segments,labelCoords,isRunning,progress,currentSeg,lapBoundaries,currentLap}),
+        isRunning&&e('div',{style:{position:"absolute",top:8,left:8,display:"flex",alignItems:"center",gap:7,background:"rgba(0,0,0,0.7)",borderRadius:8,padding:"5px 11px"}},
+          e('div',{style:{width:7,height:7,borderRadius:"50%",background:"#00ffb3",boxShadow:"0 0 8px #00ffb3",animation:"blink 0.9s infinite alternate"}}),
+          e('span',{style:{color:"#00ffb3",fontSize:11,fontWeight:"bold"}},segments[currentSeg]?`${segments[currentSeg].from} → ${segments[currentSeg].to}`:"")
+        ),
+        completedLaps>0&&e('div',{style:{position:"absolute",top:8,right:8,background:"rgba(0,0,0,0.75)",borderRadius:8,padding:"5px 11px",border:"1px solid rgba(0,255,180,0.3)"}},
+          e('span',{style:{color:"#00ffb3",fontSize:11,fontWeight:"bold"}},`🏁 ${completedLaps} LAP${completedLaps!==1?"S":""}`)
+        ),
+        segments.length===0&&e('div',{style:{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"rgba(0,229,255,0.22)",fontSize:13,textAlign:"center",padding:24}},
+          "Type a route above and click PARSE ROUTE"
+        )
+      ),
+
+      // Centre column — gauge + stats + log + sparkline
+      e('div',{style:{flex:"0 0 355px",minWidth:260,display:"flex",flexDirection:"column",gap:10}},
+        e('div',{style:{display:"flex",gap:10,alignItems:"stretch"}},
+          e('div',{style:{background:PBG,border:PBD,borderRadius:12,padding:"11px 8px",textAlign:"center",flexShrink:0}},
+            e('div',{style:LBL},"Speed Radar"),
+            e(SpeedGauge,{speedKmh,maxSpeed:20})
+          ),
+          e('div',{style:{background:PBG,border:PBD,borderRadius:12,padding:"11px 13px",flex:1,display:"flex",flexDirection:"column"}},
+            e('div',{style:LBL},"Stats"),
+            ...[["Elapsed",`${Math.floor(elMin)}m ${Math.floor((elMin%1)*60)}s`],["Total",`${totalMin} min`],["Segment",segments[currentSeg]?`${currentSeg+1}/${segments.length}`:"—"],["Current",`${speedKmh.toFixed(1)} km/h`],["Avg Spd",`${avgSpeed.toFixed(1)} km/h`],["Top Spd",`${topSpeed.toFixed(1)} km/h`],["Avg Pace",pace]].map(([k,v])=>
+              e('div',{key:k,style:{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:11}},
+                e('span',{style:{color:"rgba(255,255,255,0.35)"}},k),
+                e('span',{style:{color:"#fff",fontWeight:"bold"}},v)
+              )
+            ),
+            e('div',{style:{marginTop:"auto",paddingTop:6}},
+              e('div',{style:{display:"flex",justifyContent:"space-between",fontSize:9,color:"rgba(255,255,255,0.25)",marginBottom:3}},e('span',"PROGRESS"),e('span',`${pct.toFixed(0)}%`)),
+              e('div',{style:{height:5,background:"rgba(255,255,255,0.07)",borderRadius:3}},
+                e('div',{style:{height:"100%",borderRadius:3,width:`${pct}%`,background:"linear-gradient(90deg,#00e5ff,#00ffb3)",transition:"width 0.2s"}})
+              )
+            )
+          )
+        ),
+        log.length>0&&e('div',{style:{background:PBG,border:PBD,borderRadius:12,padding:"11px 13px"}},
+          e('div',{style:LBL},"Route Log"),
+          ...log.map((l,i)=>{
+            const done=i<currentSeg,active=i===currentSeg&&isRunning,isLapEnd=lapBoundaries.includes(i);
+            const col=done?"#00e5ff":active?"#00ffb3":"rgba(255,255,255,0.28)";
+            return e('div',{key:i,style:{display:"flex",alignItems:"center",gap:7,fontSize:11,color:col,marginBottom:4}},
+              e('span',{style:{fontSize:10,width:12,textAlign:"center"}},done?"✓":active?"▶":"○"),
+              e('span',{style:{flex:1}},l),
+              active&&e('span',{style:{fontSize:9,color:"#00ffb3",background:"rgba(0,255,180,0.1)",borderRadius:3,padding:"1px 5px"}},"LIVE"),
+              isLapEnd&&e('span',{style:{fontSize:9,color:"#f0c040",background:"rgba(240,192,64,0.1)",borderRadius:3,padding:"1px 5px"}},"🏁 LAP")
+            );
+          })
+        ),
+        speedHistory.length>4&&e('div',{style:{background:PBG,border:PBD,borderRadius:12,padding:"11px 13px"}},
+          e('div',{style:{...LBL,marginBottom:5}},"Speed History"),
+          e(SpeedSparkline,{history:speedHistory}),
+          e('div',{style:{display:"flex",justifyContent:"space-between",fontSize:9,color:"rgba(255,255,255,0.22)",marginTop:3}},e('span',"Start"),e('span',"Now"))
+        )
+      ),
+
+      // Lap counter column
+      e('div',{style:{flex:"0 0 200px",minWidth:160}},
+        e('div',{style:{background:PBG,border:PBD,borderRadius:12,padding:"14px 16px"}},
+          e('div',{style:LBL},"Lap Counter"),
+          e(LapCounter,{laps:completedLaps,totalLaps:lapBoundaries.length,lapBoundaries,currentSeg,segments,isRunning,lapFlash})
+        )
+      )
+    ),
+
+    e('style',null,`
+      @keyframes blink{from{opacity:0.4}to{opacity:1}}
+      @keyframes lapPop{0%{transform:scale(1)}40%{transform:scale(1.4)}100%{transform:scale(1)}}
+    `)
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
